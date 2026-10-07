@@ -91,8 +91,8 @@ go test ./...
 - [x] Forecasting: moving-average baseline
 - [x] RAG: `pgvector`-backed embeddings, `pqnai.embed()` / `pqnai.ask()`, self-hosted Ollama
 - [ ] Forecasting: ARIMA / Holt-Winters (ETS)
-- [ ] RAG: chunking, hybrid/reranked retrieval, guardrails, access control — see
-      [docs/rag-advanced-plan.md](docs/rag-advanced-plan.md) for the phased plan
+- [x] RAG: chunking (Phase A) — splits long documents into overlapping chunks before embedding
+- [ ] RAG: hybrid/reranked retrieval, guardrails, access control (phases B–E, tracked internally)
 - [ ] Packaging: PGXN, Docker image releases, prebuilt binaries
 - [ ] Deep-learning forecasting via ONNX Runtime (models trained offline; no Python at
       runtime)

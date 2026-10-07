@@ -21,3 +21,7 @@ test/regress/log/
 # Local env
 .env
 .DS_Store
+
+# Internal planning docs: kept locally for reference, never published
+docs/*-plan.md
+docs/plans/
