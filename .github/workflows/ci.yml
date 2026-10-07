@@ -26,7 +26,7 @@ jobs:
 
       - name: Start Postgres
         run: |
-          sudo pg_ctlcluster ${{ matrix.pg }} main start
+          sudo pg_createcluster ${{ matrix.pg }} main --port 5432 --start || sudo pg_ctlcluster ${{ matrix.pg }} main start
           sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
 
       - name: Build and install extension
@@ -72,3 +72,4 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          install-mode: goinstall
