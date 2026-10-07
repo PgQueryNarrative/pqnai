@@ -1,0 +1,26 @@
+CREATE EXTENSION pqnai;
+SELECT pqnai.version();
+ version 
+---------
+ 0.1.0
+(1 row)
+
+SELECT pqnai.enqueue_job('forecast', '{"series": [1, 2, 3], "horizon": 2}'::jsonb) > 0 AS job_enqueued;
+ job_enqueued 
+--------------
+ t
+(1 row)
+
+SELECT job_type, status FROM pqnai.jobs ORDER BY id;
+ job_type | status 
+----------+--------
+ forecast | queued
+(1 row)
+
+SELECT pqnai.wait_for_job(1, 1);
+ERROR:  pqnai: job 1 timed out after 1 seconds
+CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
+CALL pqnai.forecast(ARRAY[1, 2, 3]::double precision[], 2, 1);
+ERROR:  pqnai: job 2 timed out after 1 seconds
+CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
+PL/pgSQL function pqnai.forecast(double precision[],integer,numeric,jsonb) line 12 at assignment

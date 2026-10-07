@@ -1,0 +1,23 @@
+# Go
+/pqnaid
+*.exe
+*.test
+
+# C / PGXS build artifacts
+extension/*.o
+extension/*.so
+extension/*.bc
+extension/results/
+extension/regression.out
+extension/regression.diffs
+extension/log/
+
+# pg_regress artifacts
+test/regress/results/
+test/regress/regression.out
+test/regress/regression.diffs
+test/regress/log/
+
+# Local env
+.env
+.DS_Store

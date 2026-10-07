@@ -1,0 +1,12 @@
+FROM postgres:16
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential postgresql-server-dev-16 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY extension /usr/src/pqnai/extension
+COPY test/regress /usr/src/pqnai/test/regress
+
+RUN cd /usr/src/pqnai/extension && make && make install
+
+COPY docker/initdb.sql /docker-entrypoint-initdb.d/01-pqnai.sql
