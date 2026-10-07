@@ -16,10 +16,10 @@ SELECT job_type, status FROM pqnai.jobs WHERE job_type = 'embed' ORDER BY id;
  embed    | queued
 (1 row)
 
-CALL pqnai.embed('hello world', 1);
+CALL pqnai.embed('hello world', p_timeout_seconds => 1);
 ERROR:  pqnai: job 4 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.embed(text,numeric,bigint) line 9 at assignment
+PL/pgSQL function pqnai.embed(text,text,jsonb,numeric,bigint) line 9 at assignment
 CALL pqnai.ask('what is in the documents?', 3, 1);
 ERROR:  pqnai: job 5 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE

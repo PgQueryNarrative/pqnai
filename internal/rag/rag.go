@@ -2,6 +2,7 @@ package rag
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -20,33 +21,90 @@ type Generator interface {
 }
 
 type EmbedRequest struct {
-	Text string `json:"text"`
+	Text         string          `json:"text"`
+	Title        *string         `json:"title,omitempty"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
+	ChunkSize    int             `json:"chunk_size,omitempty"`
+	ChunkOverlap int             `json:"chunk_overlap,omitempty"`
 }
 
 type EmbedResponse struct {
-	DocumentID int64 `json:"document_id"`
+	SourceID   int64 `json:"source_id"`
+	ChunkCount int   `json:"chunk_count"`
 }
 
+// Embed splits req.Text into chunks, embeds each one, and stores them as
+// a new source + its chunks in a single transaction: either the whole
+// document lands, or none of it does, never a source with partial chunks.
 func Embed(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, req EmbedRequest) (EmbedResponse, error) {
 	if strings.TrimSpace(req.Text) == "" {
 		return EmbedResponse{}, fmt.Errorf("rag: text must not be empty")
 	}
 
-	vec, err := embedder.Embed(ctx, req.Text)
+	size := req.ChunkSize
+	if size <= 0 {
+		size = DefaultChunkSize
+	}
+	overlap := req.ChunkOverlap
+	if overlap <= 0 {
+		overlap = DefaultChunkOverlap
+	}
+
+	chunks, err := Chunk(req.Text, ChunkOptions{Size: size, Overlap: overlap})
 	if err != nil {
 		return EmbedResponse{}, err
 	}
-
-	var id int64
-	err = pool.QueryRow(ctx,
-		"INSERT INTO pqnai.documents (content, embedding) VALUES ($1, $2::vector) RETURNING id",
-		req.Text, pgvector.NewVector(vec).String(),
-	).Scan(&id)
-	if err != nil {
-		return EmbedResponse{}, fmt.Errorf("rag: store document: %w", err)
+	if len(chunks) == 0 {
+		return EmbedResponse{}, fmt.Errorf("rag: text produced no chunks")
 	}
 
-	return EmbedResponse{DocumentID: id}, nil
+	// Embed every chunk before touching the database: these are slow
+	// network calls to the model, and a Postgres transaction shouldn't
+	// sit open (holding locks) for their duration.
+	vectors := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		vec, err := embedder.Embed(ctx, chunk)
+		if err != nil {
+			return EmbedResponse{}, fmt.Errorf("rag: embed chunk %d: %w", i, err)
+		}
+		vectors[i] = pgvector.NewVector(vec).String()
+	}
+
+	metadata := req.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage("{}")
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return EmbedResponse{}, fmt.Errorf("rag: begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
+
+	var sourceID int64
+	err = tx.QueryRow(ctx,
+		"INSERT INTO pqnai.sources (title, metadata) VALUES ($1, $2::jsonb) RETURNING id",
+		req.Title, []byte(metadata),
+	).Scan(&sourceID)
+	if err != nil {
+		return EmbedResponse{}, fmt.Errorf("rag: store source: %w", err)
+	}
+
+	for i, chunk := range chunks {
+		_, err = tx.Exec(ctx,
+			"INSERT INTO pqnai.chunks (source_id, chunk_index, content, embedding) VALUES ($1, $2, $3, $4::vector)",
+			sourceID, i, chunk, vectors[i],
+		)
+		if err != nil {
+			return EmbedResponse{}, fmt.Errorf("rag: store chunk %d: %w", i, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return EmbedResponse{}, fmt.Errorf("rag: commit: %w", err)
+	}
+
+	return EmbedResponse{SourceID: sourceID, ChunkCount: len(chunks)}, nil
 }
 
 type AskRequest struct {
@@ -82,11 +140,11 @@ func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator G
 	}
 
 	rows, err := pool.Query(ctx,
-		"SELECT content FROM pqnai.documents ORDER BY embedding <=> $1::vector LIMIT $2",
+		"SELECT content FROM pqnai.chunks ORDER BY embedding <=> $1::vector LIMIT $2",
 		pgvector.NewVector(qvec).String(), req.TopK,
 	)
 	if err != nil {
-		return AskResponse{}, fmt.Errorf("rag: retrieve documents: %w", err)
+		return AskResponse{}, fmt.Errorf("rag: retrieve chunks: %w", err)
 	}
 	defer rows.Close()
 
@@ -94,12 +152,12 @@ func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator G
 	for rows.Next() {
 		var content string
 		if err := rows.Scan(&content); err != nil {
-			return AskResponse{}, fmt.Errorf("rag: scan document: %w", err)
+			return AskResponse{}, fmt.Errorf("rag: scan chunk: %w", err)
 		}
 		sources = append(sources, content)
 	}
 	if err := rows.Err(); err != nil {
-		return AskResponse{}, fmt.Errorf("rag: iterate documents: %w", err)
+		return AskResponse{}, fmt.Errorf("rag: iterate chunks: %w", err)
 	}
 
 	prompt := fmt.Sprintf(askPromptTemplate, strings.Join(sources, "\n---\n"), req.Question)

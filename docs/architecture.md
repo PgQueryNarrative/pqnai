@@ -2,9 +2,9 @@
 
 pqnai has two independently-releasable components:
 
-- **`extension/`** (C) — a thin, in-process Postgres extension. It owns the `pqnai.jobs`
-  and `pqnai.documents` tables (the latter a `pgvector` column) and a small set of
-  SQL-callable functions/procedures (`pqnai.enqueue_job`, `pqnai.wait_for_job`,
+- **`extension/`** (C) — a thin, in-process Postgres extension. It owns the `pqnai.jobs`,
+  `pqnai.sources`, and `pqnai.chunks` tables (the latter a `pgvector` column) and a small
+  set of SQL-callable functions/procedures (`pqnai.enqueue_job`, `pqnai.wait_for_job`,
   `pqnai.forecast`, `pqnai.embed`, `pqnai.ask`). It never performs network I/O and never
   links Go code into its shared library: Go's runtime installs its own signal handlers via
   cgo, which conflicts with Postgres's signal handling and is a documented source of
@@ -27,11 +27,23 @@ runnable and verifiable offline/self-hosted. Two small models are pulled on firs
 `qwen2.5:0.5b` (chat/generation). Swapping in a different embedding model requires
 updating the `vector(384)` column width in a new migration to match its output size.
 
-- `pqnai.embed(text)` → worker embeds `text` via Ollama, stores `(text, embedding)` in
-  `pqnai.documents`, returns the new row's id.
+- `pqnai.embed(text, title?, metadata?)` → splits `text` into overlapping chunks
+  (`internal/rag.Chunk`, preferring paragraph/sentence/word boundaries over mid-word
+  cuts), embeds each chunk via Ollama, and stores one `pqnai.sources` row plus one
+  `pqnai.chunks` row per chunk, all in a single transaction (so a failure partway through
+  never leaves a source with only some of its chunks). Returns the new source's id.
+  Embedding itself happens before the transaction opens, since it's a slow network call
+  per chunk and a Postgres transaction shouldn't sit open across that.
 - `pqnai.ask(question, top_k)` → worker embeds `question`, retrieves the `top_k` closest
-  `pqnai.documents` rows by cosine distance (`embedding <=> ...`, pgvector's HNSW index),
-  and asks Ollama to answer using only that retrieved context. Returns `{answer, sources}`.
+  `pqnai.chunks` rows by cosine distance (`embedding <=> ...`, pgvector's HNSW index), and
+  asks Ollama to answer using only that retrieved context. Returns `{answer, sources}`.
+
+Chunking exists because embedding a whole long document as a single vector makes
+retrieval imprecise (the vector is an average of everything the document talks about,
+diluting any specific passage a question might be about). `pqnai.sources` / `pqnai.chunks`
+is a one-time schema split done in version 0.3.0 for this reason — see
+`docs/rag-advanced-plan.md` (kept locally, not published) for the fuller plan this is
+phase one of, including why `chunks.tsv` exists already but isn't queried yet.
 
 `internal/rag`'s `Embed`/`Ask` functions take an `Embedder`/`Generator` interface rather
 than a concrete Ollama type, so tests can substitute fakes: unit tests in

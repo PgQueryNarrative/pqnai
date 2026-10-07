@@ -8,10 +8,11 @@ Part of the [PgQueryNarrative](https://github.com/PgQueryNarrative) organization
 
 ## Status
 
-Early stage (v0.2). The job-queue plumbing, a moving-average forecaster, and a full
-embed/retrieve/answer RAG pipeline (backed by `pgvector` and a self-hosted Ollama model,
-not a third-party cloud AI API) work end-to-end. ARIMA/ETS forecasting is still in
-progress — see [docs/architecture.md](docs/architecture.md) and the roadmap below.
+Early stage (v0.3). The job-queue plumbing, a moving-average forecaster, and a full
+embed/retrieve/answer RAG pipeline (chunked storage, backed by `pgvector` and a
+self-hosted Ollama model, not a third-party cloud AI API) work end-to-end. ARIMA/ETS
+forecasting, hybrid retrieval, and re-ranking are still in progress — see
+[docs/architecture.md](docs/architecture.md) and the roadmap below.
 
 ## Quickstart
 
@@ -60,11 +61,12 @@ CALL pqnai.ask(question, top_k);
 
 Each enqueues a row in `pqnai.jobs`, notifies the worker via `pg_notify`, and waits for
 the result. The worker (`pqnaid`) is a separate process that `LISTEN`s for jobs and does
-the actual work: `forecast` runs the forecasting model; `embed` calls Ollama for an
-embedding and stores it in `pqnai.documents` (a `pgvector` column); `ask` embeds the
-question, retrieves the closest stored documents by cosine distance, and asks Ollama to
-answer using only that retrieved context. Results are written back for the SQL call to
-read. See [docs/architecture.md](docs/architecture.md) for why this is a job queue
+the actual work: `forecast` runs the forecasting model; `embed` splits long text into
+overlapping chunks, calls Ollama for an embedding per chunk, and stores them in
+`pqnai.chunks` (a `pgvector` column); `ask` embeds the question, retrieves the closest
+stored chunks by cosine distance, and asks Ollama to answer using only that retrieved
+context. Results are written back for the SQL call to read. See
+[docs/architecture.md](docs/architecture.md) for why this is a job queue
 rather than a direct in-process call.
 
 ## Building from source
