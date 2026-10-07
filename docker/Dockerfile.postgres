@@ -1,7 +1,7 @@
 FROM postgres:16
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential postgresql-server-dev-16 \
+    && apt-get install -y --no-install-recommends build-essential postgresql-server-dev-16 postgresql-16-pgvector \
     && rm -rf /var/lib/apt/lists/*
 
 COPY extension /usr/src/pqnai/extension

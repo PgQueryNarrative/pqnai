@@ -1,3 +1,4 @@
+CREATE EXTENSION vector;
 CREATE EXTENSION pqnai;
 
 SELECT pqnai.version();

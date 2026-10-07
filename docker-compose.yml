@@ -14,12 +14,41 @@ services:
       timeout: 3s
       retries: 20
 
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: pulls the embedding + chat models, then exits. The worker
+  # waits on this completing successfully before it starts.
+  ollama-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull all-minilm && ollama pull qwen2.5:0.5b"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+
   worker:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
     environment:
       DATABASE_URL: postgres://postgres:pqnai@postgres:5432/pqnai
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_EMBED_MODEL: all-minilm
+      OLLAMA_CHAT_MODEL: qwen2.5:0.5b
     depends_on:
       postgres:
         condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+
+volumes:
+  ollama_data:

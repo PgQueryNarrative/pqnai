@@ -8,9 +8,10 @@ Part of the [PgQueryNarrative](https://github.com/PgQueryNarrative) organization
 
 ## Status
 
-Early stage (v0.1). The job-queue plumbing and a simple moving-average forecaster work
-end-to-end. ARIMA/ETS forecasting and embeddings/RAG are in progress — see
-[docs/architecture.md](docs/architecture.md) and the roadmap below.
+Early stage (v0.2). The job-queue plumbing, a moving-average forecaster, and a full
+embed/retrieve/answer RAG pipeline (backed by `pgvector` and a self-hosted Ollama model,
+not a third-party cloud AI API) work end-to-end. ARIMA/ETS forecasting is still in
+progress — see [docs/architecture.md](docs/architecture.md) and the roadmap below.
 
 ## Quickstart
 
@@ -18,8 +19,9 @@ end-to-end. ARIMA/ETS forecasting and embeddings/RAG are in progress — see
 docker compose up --build
 ```
 
-This builds and starts Postgres (with the `pqnai` extension installed) and the `pqnaid`
-worker. Then, from another terminal:
+This builds and starts Postgres (with the `pqnai` and `vector` extensions installed), a
+self-hosted Ollama instance (pulling a small embedding model and a small chat model on
+first run), and the `pqnaid` worker. Then, from another terminal:
 
 ```sh
 docker compose exec postgres psql -U postgres -d pqnai \
@@ -33,16 +35,37 @@ docker compose exec postgres psql -U postgres -d pqnai \
 (1 row)
 ```
 
+```sh
+docker compose exec postgres psql -U postgres -d pqnai \
+  -c "CALL pqnai.embed('The pqnaid worker listens for jobs using LISTEN and NOTIFY.');"
+docker compose exec postgres psql -U postgres -d pqnai \
+  -c "CALL pqnai.ask('What does the pqnaid worker use to listen for jobs?', 1);"
+```
+
+```
+                                       result
+-------------------------------------------------------------------------------------
+ {"answer": "The pqnaid worker listens for jobs using LISTEN and NOTIFY.", "sources":
+  ["The pqnaid worker listens for jobs using LISTEN and NOTIFY."]}
+(1 row)
+```
+
 ## How it works
 
 ```sql
 CALL pqnai.forecast(series, horizon);
+CALL pqnai.embed(text);
+CALL pqnai.ask(question, top_k);
 ```
 
-enqueues a row in `pqnai.jobs`, notifies the worker via `pg_notify`, and waits for the
-result. The worker (`pqnaid`) is a separate process that `LISTEN`s for jobs, runs the
-forecasting model, and writes the result back. See [docs/architecture.md](docs/architecture.md)
-for why this is a job queue rather than a direct in-process call.
+Each enqueues a row in `pqnai.jobs`, notifies the worker via `pg_notify`, and waits for
+the result. The worker (`pqnaid`) is a separate process that `LISTEN`s for jobs and does
+the actual work: `forecast` runs the forecasting model; `embed` calls Ollama for an
+embedding and stores it in `pqnai.documents` (a `pgvector` column); `ask` embeds the
+question, retrieves the closest stored documents by cosine distance, and asks Ollama to
+answer using only that retrieved context. Results are written back for the SQL call to
+read. See [docs/architecture.md](docs/architecture.md) for why this is a job queue
+rather than a direct in-process call.
 
 ## Building from source
 
@@ -66,11 +89,13 @@ go test ./...
 
 - [x] Job-queue plumbing: `pqnai.enqueue_job`, `pqnai.wait_for_job`, `LISTEN`/`NOTIFY`
 - [x] Forecasting: moving-average baseline
+- [x] RAG: `pgvector`-backed embeddings, `pqnai.embed()` / `pqnai.ask()`, self-hosted Ollama
 - [ ] Forecasting: ARIMA / Holt-Winters (ETS)
-- [ ] RAG: `pgvector`-backed embeddings, chunking, `pqnai.embed()` / `pqnai.ask()`
+- [ ] RAG: chunking for long documents, hybrid/reranked retrieval
 - [ ] Packaging: PGXN, Docker image releases, prebuilt binaries
 - [ ] Deep-learning forecasting via ONNX Runtime (models trained offline; no Python at
       runtime)
+- [ ] Pluggable embedding/chat providers beyond Ollama (OpenAI, Anthropic, etc.), opt-in
 
 ## License
 

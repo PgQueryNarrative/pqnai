@@ -1,9 +1,9 @@
 MODULES = pqnai
 EXTENSION = pqnai
-DATA = pqnai--0.1.0.sql
+DATA = pqnai--0.1.0.sql pqnai--0.1.0--0.2.0.sql pqnai--0.2.0.sql
 PGFILEDESC = "pqnai - AI forecasting and retrieval for Postgres"
 
-REGRESS = basic
+REGRESS = basic rag
 REGRESS_OPTS = --inputdir=../test/regress --outputdir=../test/regress
 
 PG_CONFIG = pg_config
