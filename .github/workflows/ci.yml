@@ -31,7 +31,7 @@ jobs:
 
       - name: Build and install extension
         working-directory: extension
-        run: make && sudo make install
+        run: make && sudo env PATH="$PATH" make install
 
       - name: Run regression tests
         working-directory: extension
