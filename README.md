@@ -8,10 +8,11 @@ Part of the [PgQueryNarrative](https://github.com/PgQueryNarrative) organization
 
 ## Status
 
-Early stage (v0.3). The job-queue plumbing, a moving-average forecaster, and a full
-embed/retrieve/answer RAG pipeline (chunked storage, backed by `pgvector` and a
-self-hosted Ollama model, not a third-party cloud AI API) work end-to-end. ARIMA/ETS
-forecasting, hybrid retrieval, and re-ranking are still in progress — see
+Early stage (v0.4). The job-queue plumbing, a moving-average forecaster, and a full
+embed/retrieve/answer RAG pipeline work end-to-end: chunked storage, hybrid retrieval
+(vector + full-text, fused with Reciprocal Rank Fusion), and metadata filtering, backed by
+`pgvector` and a self-hosted Ollama model rather than a third-party cloud AI API.
+ARIMA/ETS forecasting and re-ranking are still in progress — see
 [docs/architecture.md](docs/architecture.md) and the roadmap below.
 
 ## Quickstart
@@ -55,17 +56,20 @@ docker compose exec postgres psql -U postgres -d pqnai \
 
 ```sql
 CALL pqnai.forecast(series, horizon);
-CALL pqnai.embed(text);
-CALL pqnai.ask(question, top_k);
+CALL pqnai.embed(text, p_metadata => '{"tenant_id": "acme"}');
+CALL pqnai.ask(question, top_k, p_filters => '{"tenant_id": "acme"}');
 ```
+
+`p_metadata` / `p_filters` are optional; filters scope retrieval to sources whose
+metadata contains them.
 
 Each enqueues a row in `pqnai.jobs`, notifies the worker via `pg_notify`, and waits for
 the result. The worker (`pqnaid`) is a separate process that `LISTEN`s for jobs and does
 the actual work: `forecast` runs the forecasting model; `embed` splits long text into
 overlapping chunks, calls Ollama for an embedding per chunk, and stores them in
-`pqnai.chunks` (a `pgvector` column); `ask` embeds the question, retrieves the closest
-stored chunks by cosine distance, and asks Ollama to answer using only that retrieved
-context. Results are written back for the SQL call to read. See
+`pqnai.chunks` (a `pgvector` column); `ask` retrieves chunks by both vector similarity
+and full-text match, fuses the two rankings, and asks Ollama to answer using only that
+retrieved context. Results are written back for the SQL call to read. See
 [docs/architecture.md](docs/architecture.md) for why this is a job queue
 rather than a direct in-process call.
 
@@ -94,7 +98,8 @@ go test ./...
 - [x] RAG: `pgvector`-backed embeddings, `pqnai.embed()` / `pqnai.ask()`, self-hosted Ollama
 - [ ] Forecasting: ARIMA / Holt-Winters (ETS)
 - [x] RAG: chunking (Phase A) — splits long documents into overlapping chunks before embedding
-- [ ] RAG: hybrid/reranked retrieval, guardrails, access control (phases B–E, tracked internally)
+- [x] RAG: hybrid retrieval (vector + full-text via Reciprocal Rank Fusion) and metadata filters
+- [ ] RAG: re-ranking, groundedness guardrails, access control
 - [ ] Packaging: PGXN, Docker image releases, prebuilt binaries
 - [ ] Deep-learning forecasting via ONNX Runtime (models trained offline; no Python at
       runtime)

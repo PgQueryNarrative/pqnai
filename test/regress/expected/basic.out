@@ -3,7 +3,7 @@ CREATE EXTENSION pqnai;
 SELECT pqnai.version();
  version 
 ---------
- 0.3.0
+ 0.4.0
 (1 row)
 
 SELECT pqnai.enqueue_job('forecast', '{"series": [1, 2, 3], "horizon": 2}'::jsonb) > 0 AS job_enqueued;

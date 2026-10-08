@@ -34,24 +34,64 @@ updating the `vector(384)` column width in a new migration to match its output s
   never leaves a source with only some of its chunks). Returns the new source's id.
   Embedding itself happens before the transaction opens, since it's a slow network call
   per chunk and a Postgres transaction shouldn't sit open across that.
-- `pqnai.ask(question, top_k)` → worker embeds `question`, retrieves the `top_k` closest
-  `pqnai.chunks` rows by cosine distance (`embedding <=> ...`, pgvector's HNSW index), and
-  asks Ollama to answer using only that retrieved context. Returns `{answer, sources}`.
+- `pqnai.ask(question, top_k, timeout?, filters?)` → worker retrieves candidates two ways
+  and fuses them (see *Hybrid retrieval* below), keeps the top `top_k`, and asks Ollama
+  to answer using only that retrieved context. Returns `{answer, sources}`. `filters` is
+  an optional JSON object matched against `pqnai.sources.metadata` with jsonb containment
+  (`@>`), e.g. `'{"tenant_id": "acme"}'`, so retrieval can be scoped per tenant/tag.
 
 Chunking exists because embedding a whole long document as a single vector makes
 retrieval imprecise (the vector is an average of everything the document talks about,
 diluting any specific passage a question might be about). `pqnai.sources` / `pqnai.chunks`
-is a one-time schema split done in version 0.3.0 for this reason — see
-`docs/rag-advanced-plan.md` (kept locally, not published) for the fuller plan this is
-phase one of, including why `chunks.tsv` exists already but isn't queried yet.
+is a one-time schema split done in version 0.3.0 for this reason; `chunks.tsv` (a
+generated `tsvector`) was added at the same time to back hybrid retrieval in 0.4.0.
+
+### Hybrid retrieval
+
+Pure vector search blurs exact terms — names, codes, acronyms — together with
+semantically similar words; pure keyword search misses paraphrases. `ask()` runs both
+(`internal/rag/hybrid.go`):
+
+1. **Vector**: top 20 chunks by cosine distance (`chunks.embedding`, HNSW index).
+2. **Keyword**: top 20 chunks matching `plainto_tsquery(question)` against `chunks.tsv`,
+   ranked by `ts_rank` (GIN index).
+3. **Reciprocal Rank Fusion**: `score = Σ 1/(60 + rank)` over each list a chunk appears
+   in. RRF uses only rank position, so cosine distance and `ts_rank` never need to be
+   normalized against each other; a chunk ranked well by *both* beats one ranked first by
+   only one. Ties break by first-seen order, so results are deterministic.
+
+A question made only of stopwords yields an empty `tsquery`; keyword search then
+contributes nothing and retrieval falls back to the vector half.
+
+Two accuracy safeguards worth knowing about:
+
+- **Filtered HNSW searches use `hnsw.iterative_scan = strict_order`** (requires pgvector
+  ≥ 0.8.0). By default an HNSW index scan yields only `ef_search` (40) nearest chunks
+  *overall* and the metadata filter runs afterwards — so a tenant whose chunks all fall
+  outside the global top 40 would silently get **zero** results despite having matching
+  chunks. Iterative scan keeps walking the index until enough rows pass the filter.
+  `strict_order` rather than `relaxed_order` because rank position feeds RRF directly.
+- **No retrieval, no model call.** If nothing is retrieved (e.g. a filter matching no
+  sources), `ask()` returns `"No relevant context was found for this question."` without
+  calling the model at all — given an empty context, a model tends to answer from its own
+  training data anyway, producing an ungrounded answer that looks like a retrieval result.
+
+### Testing
 
 `internal/rag`'s `Embed`/`Ask` functions take an `Embedder`/`Generator` interface rather
-than a concrete Ollama type, so tests can substitute fakes: unit tests in
-`internal/rag/rag_test.go` cover validation and error propagation without a database;
-`test/integration/rag_test.go` runs the real SQL (storage + cosine-distance retrieval)
-against a live Postgres+pgvector container with a fake embedder, since real Ollama model
-inference is too slow/heavy to run in CI on every push. The full pipeline with real
-models is verified manually via `docker compose up`.
+than a concrete Ollama type, so tests can substitute fakes:
+
+- **Unit** (`internal/rag/*_test.go`, every commit, CI): chunk boundaries, RRF ordering
+  (including the exact formula and determinism), filter validation, error propagation.
+- **Integration** (`test/integration/rag_test.go`, `testcontainers-go`, real
+  Postgres+pgvector, fake model): storage, chunking, hybrid keyword rescue, filter
+  isolation, stopword fallback, and the filtered-HNSW iterative-scan fix. Each hybrid and
+  HNSW test first runs a *control* proving the failure it guards against actually
+  reproduces in its fixture (e.g. that vector-only search misses the target, or that
+  `iterative_scan = off` under-returns), and the HNSW test asserts via `EXPLAIN` that the
+  index is really used — so none of them can pass vacuously.
+- **Manual** (`docker compose up`, real Ollama models, before each release): real
+  embedding/generation quality, which is too slow and non-deterministic for CI.
 
 ## Why a job queue instead of a direct call
 

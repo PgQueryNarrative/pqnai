@@ -3,7 +3,7 @@
 -- same way basic.sql does for forecast.
 CALL pqnai.ask('what is in the documents?', 0);
 ERROR:  pqnai: top_k must be a positive integer
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb) line 6 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 6 at RAISE
 SELECT pqnai.enqueue_job('embed', '{"text": "hello world"}'::jsonb) > 0 AS job_enqueued;
  job_enqueued 
 --------------
@@ -23,4 +23,33 @@ PL/pgSQL function pqnai.embed(text,text,jsonb,numeric,bigint) line 9 at assignme
 CALL pqnai.ask('what is in the documents?', 3, 1);
 ERROR:  pqnai: job 5 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb) line 12 at assignment
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 17 at assignment
+-- filters must be a JSON object: an array or scalar is valid jsonb but
+-- would silently match no source, so it's rejected before enqueuing.
+CALL pqnai.ask('what is in the documents?', 3, 1, '["not", "an", "object"]'::jsonb);
+ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 11 at RAISE
+CALL pqnai.ask('what is in the documents?', 3, 1, '"acme"'::jsonb);
+ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 11 at RAISE
+CALL pqnai.ask('what is in the documents?', 3, 1, NULL);
+ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 11 at RAISE
+-- A valid filter reaches the worker via the job payload.
+CALL pqnai.ask('what is in the documents?', 3, 1, '{"tenant_id": "acme"}'::jsonb);
+ERROR:  pqnai: job 6 timed out after 1 seconds
+CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 17 at assignment
+SELECT payload -> 'filters' AS filters FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+        filters        
+-----------------------
+ {"tenant_id": "acme"}
+(1 row)
+
+-- Only the two valid ask() calls enqueued jobs; the rejected ones did not.
+SELECT count(*) AS ask_jobs FROM pqnai.jobs WHERE job_type = 'ask';
+ ask_jobs 
+----------
+        2
+(1 row)
+

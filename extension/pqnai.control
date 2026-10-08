@@ -1,5 +1,5 @@
 comment = 'pqnai: AI forecasting and retrieval for Postgres, backed by an external Go worker'
-default_version = '0.3.0'
+default_version = '0.4.0'
 module_pathname = '$libdir/pqnai'
 relocatable = false
 schema = pqnai

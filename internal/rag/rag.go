@@ -110,11 +110,36 @@ func Embed(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, req Embed
 type AskRequest struct {
 	Question string `json:"question"`
 	TopK     int    `json:"top_k"`
+	// Filters restricts retrieval to chunks whose source metadata
+	// contains it (jsonb @>), e.g. {"tenant_id": "acme"}. Empty means no
+	// restriction.
+	Filters json.RawMessage `json:"filters,omitempty"`
 }
+
+// NoContextAnswer is returned, without calling the model, when retrieval
+// finds no chunks for a question (e.g. its filters match no sources).
+const NoContextAnswer = "No relevant context was found for this question."
 
 type AskResponse struct {
 	Answer  string   `json:"answer"`
 	Sources []string `json:"sources"`
+}
+
+// normalizeFilters defaults an absent filter to {} (matches every source,
+// since every jsonb object contains the empty object) and rejects anything
+// that isn't a JSON object: an array or scalar would be a valid jsonb
+// value but would silently match nothing via @>, hiding a caller mistake.
+func normalizeFilters(raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return json.RawMessage("{}"), nil
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, fmt.Errorf("rag: filters must be a JSON object: %w", err)
+	}
+	return raw, nil
 }
 
 const askPromptTemplate = `Answer the question using only the context below. If the context doesn't contain the answer, say so.
@@ -134,30 +159,41 @@ func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator G
 		return AskResponse{}, fmt.Errorf("rag: top_k must be positive, got %d", req.TopK)
 	}
 
+	filters, err := normalizeFilters(req.Filters)
+	if err != nil {
+		return AskResponse{}, err
+	}
+
 	qvec, err := embedder.Embed(ctx, req.Question)
 	if err != nil {
 		return AskResponse{}, err
 	}
 
-	rows, err := pool.Query(ctx,
-		"SELECT content FROM pqnai.chunks ORDER BY embedding <=> $1::vector LIMIT $2",
-		pgvector.NewVector(qvec).String(), req.TopK,
-	)
+	vectorHits, err := vectorSearch(ctx, pool, qvec, candidatePoolSize, filters)
 	if err != nil {
-		return AskResponse{}, fmt.Errorf("rag: retrieve chunks: %w", err)
+		return AskResponse{}, err
 	}
-	defer rows.Close()
+	keywordHits, err := fullTextSearch(ctx, pool, req.Question, candidatePoolSize, filters)
+	if err != nil {
+		return AskResponse{}, err
+	}
 
-	var sources []string
-	for rows.Next() {
-		var content string
-		if err := rows.Scan(&content); err != nil {
-			return AskResponse{}, fmt.Errorf("rag: scan chunk: %w", err)
-		}
-		sources = append(sources, content)
+	fused := reciprocalRankFusion(vectorHits, keywordHits)
+	if len(fused) > req.TopK {
+		fused = fused[:req.TopK]
 	}
-	if err := rows.Err(); err != nil {
-		return AskResponse{}, fmt.Errorf("rag: iterate chunks: %w", err)
+
+	sources := make([]string, len(fused))
+	for i, c := range fused {
+		sources[i] = c.Content
+	}
+
+	// With nothing retrieved, don't call the model at all: given an empty
+	// context it tends to answer from its own training data despite the
+	// prompt's instruction, producing an ungrounded answer that looks
+	// like a retrieval result.
+	if len(sources) == 0 {
+		return AskResponse{Answer: NoContextAnswer, Sources: sources}, nil
 	}
 
 	prompt := fmt.Sprintf(askPromptTemplate, strings.Join(sources, "\n---\n"), req.Question)
