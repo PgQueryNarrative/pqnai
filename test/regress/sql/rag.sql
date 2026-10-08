@@ -17,9 +17,17 @@ CALL pqnai.ask('what is in the documents?', 3, 1, '["not", "an", "object"]'::jso
 CALL pqnai.ask('what is in the documents?', 3, 1, '"acme"'::jsonb);
 CALL pqnai.ask('what is in the documents?', 3, 1, NULL);
 
--- A valid filter reaches the worker via the job payload.
+-- A valid filter reaches the worker via the job payload; re-ranking is
+-- off unless asked for.
 CALL pqnai.ask('what is in the documents?', 3, 1, '{"tenant_id": "acme"}'::jsonb);
-SELECT payload -> 'filters' AS filters FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+SELECT payload -> 'filters' AS filters, payload -> 'rerank' AS rerank
+FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
 
--- Only the two valid ask() calls enqueued jobs; the rejected ones did not.
+-- p_rerank reaches the worker; an explicit NULL means off.
+CALL pqnai.ask('what is in the documents?', 3, 1, p_rerank => true);
+SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+CALL pqnai.ask('what is in the documents?', 3, 1, p_rerank => NULL);
+SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+
+-- Only the four valid ask() calls enqueued jobs; the rejected ones did not.
 SELECT count(*) AS ask_jobs FROM pqnai.jobs WHERE job_type = 'ask';

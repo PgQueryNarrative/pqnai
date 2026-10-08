@@ -3,7 +3,7 @@
 -- same way basic.sql does for forecast.
 CALL pqnai.ask('what is in the documents?', 0);
 ERROR:  pqnai: top_k must be a positive integer
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 6 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 6 at RAISE
 SELECT pqnai.enqueue_job('embed', '{"text": "hello world"}'::jsonb) > 0 AS job_enqueued;
  job_enqueued 
 --------------
@@ -23,33 +23,56 @@ PL/pgSQL function pqnai.embed(text,text,jsonb,numeric,bigint) line 9 at assignme
 CALL pqnai.ask('what is in the documents?', 3, 1);
 ERROR:  pqnai: job 5 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 17 at assignment
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
 -- filters must be a JSON object: an array or scalar is valid jsonb but
 -- would silently match no source, so it's rejected before enqueuing.
 CALL pqnai.ask('what is in the documents?', 3, 1, '["not", "an", "object"]'::jsonb);
 ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 11 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 11 at RAISE
 CALL pqnai.ask('what is in the documents?', 3, 1, '"acme"'::jsonb);
 ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 11 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 11 at RAISE
 CALL pqnai.ask('what is in the documents?', 3, 1, NULL);
 ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 11 at RAISE
--- A valid filter reaches the worker via the job payload.
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 11 at RAISE
+-- A valid filter reaches the worker via the job payload; re-ranking is
+-- off unless asked for.
 CALL pqnai.ask('what is in the documents?', 3, 1, '{"tenant_id": "acme"}'::jsonb);
 ERROR:  pqnai: job 6 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,jsonb) line 17 at assignment
-SELECT payload -> 'filters' AS filters FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
-        filters        
------------------------
- {"tenant_id": "acme"}
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
+SELECT payload -> 'filters' AS filters, payload -> 'rerank' AS rerank
+FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+        filters        | rerank 
+-----------------------+--------
+ {"tenant_id": "acme"} | false
 (1 row)
 
--- Only the two valid ask() calls enqueued jobs; the rejected ones did not.
+-- p_rerank reaches the worker; an explicit NULL means off.
+CALL pqnai.ask('what is in the documents?', 3, 1, p_rerank => true);
+ERROR:  pqnai: job 7 timed out after 1 seconds
+CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
+SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+ rerank 
+--------
+ true
+(1 row)
+
+CALL pqnai.ask('what is in the documents?', 3, 1, p_rerank => NULL);
+ERROR:  pqnai: job 8 timed out after 1 seconds
+CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
+SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+ rerank 
+--------
+ false
+(1 row)
+
+-- Only the four valid ask() calls enqueued jobs; the rejected ones did not.
 SELECT count(*) AS ask_jobs FROM pqnai.jobs WHERE job_type = 'ask';
  ask_jobs 
 ----------
-        2
+        4
 (1 row)
 

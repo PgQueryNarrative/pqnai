@@ -1,6 +1,6 @@
 MODULES = pqnai
 EXTENSION = pqnai
-DATA = pqnai--0.1.0.sql pqnai--0.1.0--0.2.0.sql pqnai--0.2.0.sql pqnai--0.2.0--0.3.0.sql pqnai--0.3.0.sql pqnai--0.3.0--0.4.0.sql pqnai--0.4.0.sql
+DATA = pqnai--0.1.0.sql pqnai--0.1.0--0.2.0.sql pqnai--0.2.0.sql pqnai--0.2.0--0.3.0.sql pqnai--0.3.0.sql pqnai--0.3.0--0.4.0.sql pqnai--0.4.0.sql pqnai--0.4.0--0.5.0.sql pqnai--0.5.0.sql
 PGFILEDESC = "pqnai - AI forecasting and retrieval for Postgres"
 
 REGRESS = basic rag

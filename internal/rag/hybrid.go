@@ -61,18 +61,30 @@ func vectorSearch(ctx context.Context, pool *pgxpool.Pool, vec []float32, limit 
 	return collectCandidates(rows, "vector search")
 }
 
-// fullTextSearch returns up to limit chunks matching query as a
-// Postgres full-text search, ordered by ts_rank, restricted the same
+// fullTextSearch returns up to limit chunks matching any term of query as
+// a Postgres full-text search, ordered by ts_rank, restricted the same
 // way as vectorSearch. Catches exact terms (names, codes, acronyms) that
 // an embedding can blur together with semantically similar words.
+//
+// plainto_tsquery joins terms with AND, which would require a chunk to
+// contain every non-stopword in a natural-language question ("how do I
+// fix error PQX-7731" would miss a chunk about PQX-7731 that never says
+// "fix"). Its output is rewritten to OR instead: plainto_tsquery first
+// reduces any input to quoted lexemes joined by " & " (lexemes never
+// contain spaces), so swapping that separator for " | " always yields a
+// valid query, even for input full of tsquery operator characters.
+// ts_rank then favors chunks matching more of the terms.
 func fullTextSearch(ctx context.Context, pool *pgxpool.Pool, query string, limit int, filters json.RawMessage) ([]candidate, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT c.id, c.content
 		FROM pqnai.chunks c
 		JOIN pqnai.sources s ON s.id = c.source_id
+		CROSS JOIN (
+			SELECT replace(plainto_tsquery('english', $2)::text, ' & ', ' | ')::tsquery AS q
+		) terms
 		WHERE s.metadata @> $1::jsonb
-		  AND c.tsv @@ plainto_tsquery('english', $2)
-		ORDER BY ts_rank(c.tsv, plainto_tsquery('english', $2)) DESC
+		  AND c.tsv @@ terms.q
+		ORDER BY ts_rank(c.tsv, terms.q) DESC
 		LIMIT $3
 	`, []byte(filters), query, limit)
 	if err != nil {

@@ -113,8 +113,10 @@ func TestRAG(t *testing.T) {
 	t.Run("vector round trip", func(t *testing.T) { testVectorRoundTrip(t, ctx, pool, embedder) })
 	t.Run("chunked embed", func(t *testing.T) { testChunkedEmbed(t, ctx, pool, embedder) })
 	t.Run("hybrid keyword rescue", func(t *testing.T) { testHybridKeywordRescue(t, ctx, pool, embedder) })
+	t.Run("hybrid keyword rescue with natural-language question", func(t *testing.T) { testHybridNaturalQuestion(t, ctx, pool, embedder) })
 	t.Run("filters isolate sources", func(t *testing.T) { testFiltersIsolate(t, ctx, pool, embedder) })
 	t.Run("stopword-only question falls back to vector", func(t *testing.T) { testStopwordFallback(t, ctx, pool, embedder) })
+	t.Run("rerank promotes the relevant chunk", func(t *testing.T) { testRerank(t, ctx, pool, embedder) })
 	// Must run last: it disables sequential scans database-wide.
 	t.Run("filtered hnsw search does not under-return", func(t *testing.T) { testFilteredHNSW(t, ctx, pool, dbURL, embedder) })
 }
@@ -130,7 +132,7 @@ func testVectorRoundTrip(t *testing.T, ctx context.Context, pool *pgxpool.Pool, 
 		}
 	}
 
-	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, rag.AskRequest{Question: "query", TopK: 1})
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{Question: "query", TopK: 1})
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
@@ -226,7 +228,7 @@ func testHybridKeywordRescue(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	}
 
 	// Hybrid: the keyword match is fused in and ranked first.
-	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, rag.AskRequest{
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
 		Question: hybridQuestion, TopK: 3, Filters: hybridSuite,
 	})
 	if err != nil {
@@ -237,11 +239,43 @@ func testHybridKeywordRescue(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	}
 }
 
+// testHybridNaturalQuestion guards the AND->OR rewrite in fullTextSearch.
+// A real question carries words the target chunk never uses ("get rid
+// of"), and plainto_tsquery's AND semantics would then require every one
+// of them, so keyword search would match nothing exactly when it's
+// needed. The control proves the AND form really misses the target here.
+func testHybridNaturalQuestion(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder fakeEmbedder) {
+	const question = "how do I get rid of a zyzzyva"
+	embedder.vectors[question] = vec384(10) // same direction as the noise, far from the target
+
+	var andMatches int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM pqnai.chunks c JOIN pqnai.sources s ON s.id = c.source_id
+		WHERE s.metadata @> $1::jsonb AND c.tsv @@ plainto_tsquery('english', $2)`,
+		[]byte(hybridSuite), question,
+	).Scan(&andMatches); err != nil {
+		t.Fatalf("control AND query: %v", err)
+	}
+	if andMatches != 0 {
+		t.Fatalf("control failed: AND semantics already match %d chunks, so this fixture can't demonstrate the OR rewrite", andMatches)
+	}
+
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
+		Question: question, TopK: 3, Filters: hybridSuite,
+	})
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if len(resp.Sources) == 0 || resp.Sources[0] != hybridTarget {
+		t.Fatalf("expected keyword match %q first despite extra question words, got %q", hybridTarget, resp.Sources)
+	}
+}
+
 func testFiltersIsolate(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder fakeEmbedder) {
 	// A filter matching nothing returns no sources and never calls the
 	// model, rather than letting it answer from an empty context.
 	gen := &fakeGenerator{}
-	resp, err := rag.Ask(ctx, pool, embedder, gen, rag.AskRequest{
+	resp, err := rag.Ask(ctx, pool, embedder, gen, nil, rag.AskRequest{
 		Question: hybridQuestion, TopK: 3, Filters: json.RawMessage(`{"suite": "does-not-exist"}`),
 	})
 	if err != nil {
@@ -263,7 +297,7 @@ func testFiltersIsolate(t *testing.T, ctx context.Context, pool *pgxpool.Pool, e
 	for _, n := range hybridNoise {
 		allowed[n] = true
 	}
-	resp, err = rag.Ask(ctx, pool, embedder, &fakeGenerator{}, rag.AskRequest{
+	resp, err = rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
 		Question: hybridQuestion, TopK: 50, Filters: hybridSuite,
 	})
 	if err != nil {
@@ -286,7 +320,7 @@ func testStopwordFallback(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	const question = "what is it"
 	embedder.vectors[question] = vec384(10)
 
-	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, rag.AskRequest{
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
 		Question: question, TopK: 1, Filters: hybridSuite,
 	})
 	if err != nil {
@@ -294,6 +328,93 @@ func testStopwordFallback(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	}
 	if len(resp.Sources) != 1 {
 		t.Fatalf("expected vector search to still return 1 source, got %q", resp.Sources)
+	}
+}
+
+// contentReranker scores each passage by a fixed lookup, standing in for
+// a model that recognizes which passage actually answers the question.
+type contentReranker struct {
+	scores map[string]float64
+	err    error
+}
+
+func (r contentReranker) Score(ctx context.Context, question string, passages []string) ([]float64, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	out := make([]float64, len(passages))
+	for i, p := range passages {
+		out[i] = r.scores[p]
+	}
+	return out, nil
+}
+
+// testRerank runs real hybrid retrieval, then re-ranking. The control
+// proves retrieval alone puts the answering chunk last, so re-ranking is
+// what moves it -- and a failing reranker must leave exactly that
+// retrieval order in place rather than failing the question.
+func testRerank(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder fakeEmbedder) {
+	suite := json.RawMessage(`{"suite": "rerank"}`)
+	const question = "which ingredient makes it rise"
+	const answer = "Yeast ferments the sugars and produces the gas that leavens bread."
+	distractors := []string{
+		"Bread is baked in an oven at a high temperature.",
+		"Sourdough bread has a tangy flavor.",
+		"Bread crust browns through the Maillard reaction.",
+	}
+
+	embedder.vectors[question] = vec384(20)
+	embedder.vectors[answer] = vec384(21) // far from the question, and no shared lexemes
+	for i, d := range distractors {
+		// Distinct distances: tied rows have no guaranteed order, and the
+		// fallback check below compares two queries' orderings exactly.
+		v := vec384(20)
+		v[22] = float32(i+1) * 1e-3
+		embedder.vectors[d] = v
+	}
+	for _, text := range append(append([]string{}, distractors...), answer) {
+		if _, err := rag.Embed(ctx, pool, embedder, rag.EmbedRequest{Text: text, Metadata: suite}); err != nil {
+			t.Fatalf("embed %q: %v", text, err)
+		}
+	}
+
+	base, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{Question: question, TopK: 4, Filters: suite})
+	if err != nil {
+		t.Fatalf("ask without rerank: %v", err)
+	}
+	if len(base.Sources) != 4 || base.Sources[3] != answer {
+		t.Fatalf("control failed: expected retrieval alone to rank the answer last, got %q", base.Sources)
+	}
+	if base.Reranked {
+		t.Fatal("expected reranked=false when re-ranking wasn't requested")
+	}
+
+	scores := map[string]float64{answer: 10}
+	for _, d := range distractors {
+		scores[d] = 1
+	}
+	reranked, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, contentReranker{scores: scores},
+		rag.AskRequest{Question: question, TopK: 1, Filters: suite, Rerank: true})
+	if err != nil {
+		t.Fatalf("ask with rerank: %v", err)
+	}
+	if !reranked.Reranked || reranked.RerankError != "" {
+		t.Fatalf("expected a successful rerank, got reranked=%v error=%q", reranked.Reranked, reranked.RerankError)
+	}
+	if len(reranked.Sources) != 1 || reranked.Sources[0] != answer {
+		t.Fatalf("expected re-ranking to promote the answer from last to first, got %q", reranked.Sources)
+	}
+
+	failed, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, contentReranker{err: fmt.Errorf("model unavailable")},
+		rag.AskRequest{Question: question, TopK: 4, Filters: suite, Rerank: true})
+	if err != nil {
+		t.Fatalf("a reranker failure must not fail the question: %v", err)
+	}
+	if failed.Reranked || !strings.Contains(failed.RerankError, "model unavailable") {
+		t.Fatalf("expected reranked=false with the failure reported, got reranked=%v error=%q", failed.Reranked, failed.RerankError)
+	}
+	if strings.Join(failed.Sources, "|") != strings.Join(base.Sources, "|") {
+		t.Fatalf("expected fallback to the retrieval order %q, got %q", base.Sources, failed.Sources)
 	}
 }
 
@@ -386,7 +507,7 @@ func testFilteredHNSW(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dbU
 	}
 
 	// The real code path finds all of tenant b's chunks.
-	resp, err := rag.Ask(ctx, idxPool, embedder, &fakeGenerator{}, rag.AskRequest{
+	resp, err := rag.Ask(ctx, idxPool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
 		Question: "query", TopK: 3, Filters: tenantB,
 	})
 	if err != nil {

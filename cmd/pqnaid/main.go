@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -25,8 +26,9 @@ const pollInterval = 5 * time.Second
 
 // worker bundles the dependencies every job handler needs.
 type worker struct {
-	pool   *pgxpool.Pool
-	ollama *rag.OllamaClient
+	pool     *pgxpool.Pool
+	ollama   *rag.OllamaClient
+	reranker rag.Reranker
 }
 
 func main() {
@@ -38,6 +40,13 @@ func main() {
 	ollamaURL := envOr("OLLAMA_URL", "http://localhost:11434")
 	embedModel := envOr("OLLAMA_EMBED_MODEL", "all-minilm")
 	chatModel := envOr("OLLAMA_CHAT_MODEL", "qwen2.5:0.5b")
+	// Grading relevance is a different task from answering; a stronger
+	// model can be used for it without slowing every answer down.
+	rerankModel := envOr("OLLAMA_RERANK_MODEL", chatModel)
+	numCtx, err := strconv.Atoi(envOr("OLLAMA_NUM_CTX", strconv.Itoa(rag.DefaultNumCtx)))
+	if err != nil || numCtx <= 0 {
+		log.Fatalf("pqnaid: OLLAMA_NUM_CTX must be a positive integer, got %q", os.Getenv("OLLAMA_NUM_CTX"))
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -48,9 +57,15 @@ func main() {
 	}
 	defer pool.Close()
 
+	ollama := rag.NewOllamaClient(ollamaURL, embedModel, chatModel)
+	ollama.NumCtx = numCtx
+	rerankClient := rag.NewOllamaClient(ollamaURL, embedModel, rerankModel)
+	rerankClient.NumCtx = numCtx
+
 	w := &worker{
-		pool:   pool,
-		ollama: rag.NewOllamaClient(ollamaURL, embedModel, chatModel),
+		pool:     pool,
+		ollama:   ollama,
+		reranker: rag.NewLLMReranker(rerankClient),
 	}
 
 	log.Println("pqnaid: connected, draining any backlog")
@@ -175,7 +190,7 @@ func (w *worker) handleAsk(ctx context.Context, job *pgjobs.Job) {
 		return
 	}
 
-	resp, err := rag.Ask(ctx, w.pool, w.ollama, w.ollama, req)
+	resp, err := rag.Ask(ctx, w.pool, w.ollama, w.ollama, w.reranker, req)
 	if err != nil {
 		w.failJob(ctx, job.ID, err.Error())
 		return

@@ -14,10 +14,18 @@ import (
 	"time"
 )
 
+// DefaultNumCtx is the context window (in tokens) requested for every
+// generation call. The largest prompt pqnai builds is roughly 40 retrieved
+// chunks of up to 500 characters (~5k tokens of English), so this leaves
+// ample headroom; anything that still doesn't fit is rejected rather than
+// truncated (see generate).
+const DefaultNumCtx = 16384
+
 type OllamaClient struct {
 	BaseURL    string
 	EmbedModel string
 	ChatModel  string
+	NumCtx     int
 	HTTPClient *http.Client
 }
 
@@ -26,6 +34,7 @@ func NewOllamaClient(baseURL, embedModel, chatModel string) *OllamaClient {
 		BaseURL:    baseURL,
 		EmbedModel: embedModel,
 		ChatModel:  chatModel,
+		NumCtx:     DefaultNumCtx,
 		HTTPClient: &http.Client{Timeout: 2 * time.Minute},
 	}
 }
@@ -50,10 +59,18 @@ func (c *OllamaClient) Embed(ctx context.Context, text string) ([]float32, error
 	return resp.Embedding, nil
 }
 
+type generateOptions struct {
+	NumCtx      int      `json:"num_ctx,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
+}
+
 type generateRequestBody struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+	Model    string          `json:"model"`
+	Prompt   string          `json:"prompt"`
+	Stream   bool            `json:"stream"`
+	Truncate bool            `json:"truncate"`
+	Format   json.RawMessage `json:"format,omitempty"`
+	Options  generateOptions `json:"options"`
 }
 
 type generateResponseBody struct {
@@ -61,8 +78,35 @@ type generateResponseBody struct {
 }
 
 func (c *OllamaClient) Generate(ctx context.Context, prompt string) (string, error) {
+	return c.generate(ctx, prompt, nil, nil)
+}
+
+// GenerateJSON constrains the output to schema (a JSON Schema) using
+// Ollama's structured outputs, at temperature 0 so the same input is
+// graded the same way every time.
+func (c *OllamaClient) GenerateJSON(ctx context.Context, prompt string, schema json.RawMessage) (string, error) {
+	zero := 0.0
+	return c.generate(ctx, prompt, schema, &zero)
+}
+
+// generate sets an explicit context window and truncate=false on every
+// call. Without them, Ollama silently drops tokens from the *start* of a
+// prompt longer than its default window -- verified against Ollama 0.40:
+// an 11.6k-token prompt was cut to ~2k tokens with no error, losing the
+// instruction at its top. pqnai's prompts lead with their grounding
+// instructions and highest-ranked context, the parts that must survive,
+// so an over-long prompt now fails loudly instead.
+func (c *OllamaClient) generate(ctx context.Context, prompt string, format json.RawMessage, temperature *float64) (string, error) {
+	body := generateRequestBody{
+		Model:    c.ChatModel,
+		Prompt:   prompt,
+		Stream:   false,
+		Truncate: false,
+		Format:   format,
+		Options:  generateOptions{NumCtx: c.NumCtx, Temperature: temperature},
+	}
 	var resp generateResponseBody
-	if err := c.postJSON(ctx, "/api/generate", generateRequestBody{Model: c.ChatModel, Prompt: prompt, Stream: false}, &resp); err != nil {
+	if err := c.postJSON(ctx, "/api/generate", body, &resp); err != nil {
 		return "", fmt.Errorf("ollama generate: %w", err)
 	}
 	return resp.Response, nil

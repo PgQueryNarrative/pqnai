@@ -31,10 +31,10 @@ func TestAskValidation(t *testing.T) {
 	embedder := fakeEmbedder{vec: []float32{0.1, 0.2}}
 	generator := &fakeGenerator{answer: "yes"}
 
-	if _, err := Ask(context.Background(), nil, embedder, generator, AskRequest{Question: "", TopK: 3}); err == nil {
+	if _, err := Ask(context.Background(), nil, embedder, generator, nil, AskRequest{Question: "", TopK: 3}); err == nil {
 		t.Fatal("expected error for empty question")
 	}
-	if _, err := Ask(context.Background(), nil, embedder, generator, AskRequest{Question: "hi", TopK: 0}); err == nil {
+	if _, err := Ask(context.Background(), nil, embedder, generator, nil, AskRequest{Question: "hi", TopK: 0}); err == nil {
 		t.Fatal("expected error for non-positive top_k")
 	}
 }
@@ -79,7 +79,7 @@ func TestAskRejectsBadFiltersBeforeEmbedding(t *testing.T) {
 	embedder := &countingEmbedder{}
 	generator := &fakeGenerator{answer: "yes"}
 
-	_, err := Ask(context.Background(), nil, embedder, generator, AskRequest{
+	_, err := Ask(context.Background(), nil, embedder, generator, nil, AskRequest{
 		Question: "hi",
 		TopK:     3,
 		Filters:  json.RawMessage(`["not", "an", "object"]`),
@@ -103,7 +103,7 @@ func TestAskEmbedderError(t *testing.T) {
 	embedder := fakeEmbedder{err: errors.New("boom")}
 	generator := &fakeGenerator{}
 
-	if _, err := Ask(context.Background(), nil, embedder, generator, AskRequest{Question: "hi", TopK: 3}); err == nil {
+	if _, err := Ask(context.Background(), nil, embedder, generator, nil, AskRequest{Question: "hi", TopK: 3}); err == nil {
 		t.Fatal("expected error to propagate from embedder")
 	}
 }

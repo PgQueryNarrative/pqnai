@@ -114,6 +114,9 @@ type AskRequest struct {
 	// contains it (jsonb @>), e.g. {"tenant_id": "acme"}. Empty means no
 	// restriction.
 	Filters json.RawMessage `json:"filters,omitempty"`
+	// Rerank re-scores the top fused candidates with the Reranker before
+	// truncating to TopK. Costs an extra model call.
+	Rerank bool `json:"rerank,omitempty"`
 }
 
 // NoContextAnswer is returned, without calling the model, when retrieval
@@ -123,6 +126,11 @@ const NoContextAnswer = "No relevant context was found for this question."
 type AskResponse struct {
 	Answer  string   `json:"answer"`
 	Sources []string `json:"sources"`
+	// Reranked reports whether the sources' order came from the
+	// reranker. False when re-ranking wasn't requested, or when it was
+	// but failed and fell back to the fused order (see RerankError).
+	Reranked    bool   `json:"reranked"`
+	RerankError string `json:"rerank_error,omitempty"`
 }
 
 // normalizeFilters defaults an absent filter to {} (matches every source,
@@ -151,12 +159,17 @@ Question: %s
 
 Answer:`
 
-func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator Generator, req AskRequest) (AskResponse, error) {
+// Ask retrieves context for req.Question and generates an answer from it.
+// reranker may be nil unless req.Rerank is set.
+func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator Generator, reranker Reranker, req AskRequest) (AskResponse, error) {
 	if strings.TrimSpace(req.Question) == "" {
 		return AskResponse{}, fmt.Errorf("rag: question must not be empty")
 	}
 	if req.TopK <= 0 {
 		return AskResponse{}, fmt.Errorf("rag: top_k must be positive, got %d", req.TopK)
+	}
+	if req.Rerank && reranker == nil {
+		return AskResponse{}, fmt.Errorf("rag: rerank requested but no reranker is configured")
 	}
 
 	filters, err := normalizeFilters(req.Filters)
@@ -179,6 +192,26 @@ func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator G
 	}
 
 	fused := reciprocalRankFusion(vectorHits, keywordHits)
+
+	// With nothing retrieved, don't call any model: given an empty
+	// context the generator tends to answer from its own training data
+	// despite the prompt's instruction, producing an ungrounded answer
+	// that looks like a retrieval result.
+	if len(fused) == 0 {
+		return AskResponse{Answer: NoContextAnswer, Sources: []string{}}, nil
+	}
+
+	var resp AskResponse
+	if req.Rerank {
+		reordered, err := rerankCandidates(ctx, reranker, req.Question, fused)
+		if err != nil {
+			resp.RerankError = err.Error()
+		} else {
+			resp.Reranked = true
+		}
+		fused = reordered
+	}
+
 	if len(fused) > req.TopK {
 		fused = fused[:req.TopK]
 	}
@@ -187,14 +220,7 @@ func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator G
 	for i, c := range fused {
 		sources[i] = c.Content
 	}
-
-	// With nothing retrieved, don't call the model at all: given an empty
-	// context it tends to answer from its own training data despite the
-	// prompt's instruction, producing an ungrounded answer that looks
-	// like a retrieval result.
-	if len(sources) == 0 {
-		return AskResponse{Answer: NoContextAnswer, Sources: sources}, nil
-	}
+	resp.Sources = sources
 
 	prompt := fmt.Sprintf(askPromptTemplate, strings.Join(sources, "\n---\n"), req.Question)
 	answer, err := generator.Generate(ctx, prompt)
@@ -202,5 +228,6 @@ func Ask(ctx context.Context, pool *pgxpool.Pool, embedder Embedder, generator G
 		return AskResponse{}, err
 	}
 
-	return AskResponse{Answer: strings.TrimSpace(answer), Sources: sources}, nil
+	resp.Answer = strings.TrimSpace(answer)
+	return resp, nil
 }
