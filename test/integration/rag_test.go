@@ -32,11 +32,27 @@ func (f fakeEmbedder) Embed(ctx context.Context, text string) ([]float32, error)
 	return make([]float32, 384), nil
 }
 
-type fakeGenerator struct{ calls int }
+type fakeGenerator struct {
+	answer string // defaults to "fake answer" if unset
+	calls  int
+}
 
 func (g *fakeGenerator) Generate(ctx context.Context, prompt string) (string, error) {
 	g.calls++
-	return "fake answer", nil
+	if g.answer == "" {
+		return "fake answer", nil
+	}
+	return g.answer, nil
+}
+
+// contents extracts just the text of each source, for tests that don't
+// care about citation ids.
+func contents(sources []rag.Source) []string {
+	out := make([]string, len(sources))
+	for i, s := range sources {
+		out[i] = s.Content
+	}
+	return out
 }
 
 func vec384(nonZeroIdx int) []float32 {
@@ -117,6 +133,7 @@ func TestRAG(t *testing.T) {
 	t.Run("filters isolate sources", func(t *testing.T) { testFiltersIsolate(t, ctx, pool, embedder) })
 	t.Run("stopword-only question falls back to vector", func(t *testing.T) { testStopwordFallback(t, ctx, pool, embedder) })
 	t.Run("rerank promotes the relevant chunk", func(t *testing.T) { testRerank(t, ctx, pool, embedder) })
+	t.Run("groundedness check", func(t *testing.T) { testGroundedness(t, ctx, pool, embedder) })
 	// Must run last: it disables sequential scans database-wide.
 	t.Run("filtered hnsw search does not under-return", func(t *testing.T) { testFilteredHNSW(t, ctx, pool, dbURL, embedder) })
 }
@@ -132,12 +149,15 @@ func testVectorRoundTrip(t *testing.T, ctx context.Context, pool *pgxpool.Pool, 
 		}
 	}
 
-	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{Question: "query", TopK: 1})
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, nil, rag.AskRequest{Question: "query", TopK: 1})
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
-	if len(resp.Sources) != 1 || resp.Sources[0] != "about dogs" {
-		t.Fatalf("expected closest match ['about dogs'], got %q", resp.Sources)
+	if len(resp.Sources) != 1 || resp.Sources[0].Content != "about dogs" {
+		t.Fatalf("expected closest match ['about dogs'], got %q", contents(resp.Sources))
+	}
+	if resp.Sources[0].ID != 1 {
+		t.Fatalf("expected the single source to be cited as id 1, got %d", resp.Sources[0].ID)
 	}
 }
 
@@ -228,14 +248,14 @@ func testHybridKeywordRescue(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	}
 
 	// Hybrid: the keyword match is fused in and ranked first.
-	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, nil, rag.AskRequest{
 		Question: hybridQuestion, TopK: 3, Filters: hybridSuite,
 	})
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
-	if len(resp.Sources) == 0 || resp.Sources[0] != hybridTarget {
-		t.Fatalf("expected hybrid retrieval to rank the keyword match %q first, got %q", hybridTarget, resp.Sources)
+	if len(resp.Sources) == 0 || resp.Sources[0].Content != hybridTarget {
+		t.Fatalf("expected hybrid retrieval to rank the keyword match %q first, got %q", hybridTarget, contents(resp.Sources))
 	}
 }
 
@@ -260,14 +280,14 @@ func testHybridNaturalQuestion(t *testing.T, ctx context.Context, pool *pgxpool.
 		t.Fatalf("control failed: AND semantics already match %d chunks, so this fixture can't demonstrate the OR rewrite", andMatches)
 	}
 
-	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, nil, rag.AskRequest{
 		Question: question, TopK: 3, Filters: hybridSuite,
 	})
 	if err != nil {
 		t.Fatalf("ask: %v", err)
 	}
-	if len(resp.Sources) == 0 || resp.Sources[0] != hybridTarget {
-		t.Fatalf("expected keyword match %q first despite extra question words, got %q", hybridTarget, resp.Sources)
+	if len(resp.Sources) == 0 || resp.Sources[0].Content != hybridTarget {
+		t.Fatalf("expected keyword match %q first despite extra question words, got %q", hybridTarget, contents(resp.Sources))
 	}
 }
 
@@ -275,20 +295,23 @@ func testFiltersIsolate(t *testing.T, ctx context.Context, pool *pgxpool.Pool, e
 	// A filter matching nothing returns no sources and never calls the
 	// model, rather than letting it answer from an empty context.
 	gen := &fakeGenerator{}
-	resp, err := rag.Ask(ctx, pool, embedder, gen, nil, rag.AskRequest{
+	resp, err := rag.Ask(ctx, pool, embedder, gen, nil, nil, rag.AskRequest{
 		Question: hybridQuestion, TopK: 3, Filters: json.RawMessage(`{"suite": "does-not-exist"}`),
 	})
 	if err != nil {
 		t.Fatalf("ask with unmatched filter: %v", err)
 	}
 	if len(resp.Sources) != 0 {
-		t.Fatalf("expected no sources for an unmatched filter, got %q", resp.Sources)
+		t.Fatalf("expected no sources for an unmatched filter, got %q", contents(resp.Sources))
 	}
 	if resp.Answer != rag.NoContextAnswer {
 		t.Fatalf("expected %q, got %q", rag.NoContextAnswer, resp.Answer)
 	}
 	if gen.calls != 0 {
 		t.Fatalf("expected the model not to be called with no context, got %d calls", gen.calls)
+	}
+	if resp.GroundednessError != "no context was retrieved to check" {
+		t.Fatalf("expected a no-context explanation, got %q", resp.GroundednessError)
 	}
 
 	// A matching filter only ever returns chunks from that suite, even
@@ -297,18 +320,18 @@ func testFiltersIsolate(t *testing.T, ctx context.Context, pool *pgxpool.Pool, e
 	for _, n := range hybridNoise {
 		allowed[n] = true
 	}
-	resp, err = rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
+	resp, err = rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, nil, rag.AskRequest{
 		Question: hybridQuestion, TopK: 50, Filters: hybridSuite,
 	})
 	if err != nil {
 		t.Fatalf("ask with suite filter: %v", err)
 	}
 	if len(resp.Sources) != len(allowed) {
-		t.Fatalf("expected exactly the %d suite chunks, got %d: %q", len(allowed), len(resp.Sources), resp.Sources)
+		t.Fatalf("expected exactly the %d suite chunks, got %d: %q", len(allowed), len(resp.Sources), contents(resp.Sources))
 	}
 	for _, s := range resp.Sources {
-		if !allowed[s] {
-			t.Fatalf("filter leaked a chunk from outside the suite: %q", s)
+		if !allowed[s.Content] {
+			t.Fatalf("filter leaked a chunk from outside the suite: %q", s.Content)
 		}
 	}
 }
@@ -320,14 +343,14 @@ func testStopwordFallback(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	const question = "what is it"
 	embedder.vectors[question] = vec384(10)
 
-	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
+	resp, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, nil, rag.AskRequest{
 		Question: question, TopK: 1, Filters: hybridSuite,
 	})
 	if err != nil {
 		t.Fatalf("ask with stopword-only question: %v", err)
 	}
 	if len(resp.Sources) != 1 {
-		t.Fatalf("expected vector search to still return 1 source, got %q", resp.Sources)
+		t.Fatalf("expected vector search to still return 1 source, got %q", contents(resp.Sources))
 	}
 }
 
@@ -378,12 +401,12 @@ func testRerank(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder 
 		}
 	}
 
-	base, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, rag.AskRequest{Question: question, TopK: 4, Filters: suite})
+	base, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, nil, nil, rag.AskRequest{Question: question, TopK: 4, Filters: suite})
 	if err != nil {
 		t.Fatalf("ask without rerank: %v", err)
 	}
-	if len(base.Sources) != 4 || base.Sources[3] != answer {
-		t.Fatalf("control failed: expected retrieval alone to rank the answer last, got %q", base.Sources)
+	if len(base.Sources) != 4 || base.Sources[3].Content != answer {
+		t.Fatalf("control failed: expected retrieval alone to rank the answer last, got %q", contents(base.Sources))
 	}
 	if base.Reranked {
 		t.Fatal("expected reranked=false when re-ranking wasn't requested")
@@ -393,7 +416,7 @@ func testRerank(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder 
 	for _, d := range distractors {
 		scores[d] = 1
 	}
-	reranked, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, contentReranker{scores: scores},
+	reranked, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, contentReranker{scores: scores}, nil,
 		rag.AskRequest{Question: question, TopK: 1, Filters: suite, Rerank: true})
 	if err != nil {
 		t.Fatalf("ask with rerank: %v", err)
@@ -401,11 +424,11 @@ func testRerank(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder 
 	if !reranked.Reranked || reranked.RerankError != "" {
 		t.Fatalf("expected a successful rerank, got reranked=%v error=%q", reranked.Reranked, reranked.RerankError)
 	}
-	if len(reranked.Sources) != 1 || reranked.Sources[0] != answer {
-		t.Fatalf("expected re-ranking to promote the answer from last to first, got %q", reranked.Sources)
+	if len(reranked.Sources) != 1 || reranked.Sources[0].Content != answer {
+		t.Fatalf("expected re-ranking to promote the answer from last to first, got %q", contents(reranked.Sources))
 	}
 
-	failed, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, contentReranker{err: fmt.Errorf("model unavailable")},
+	failed, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{}, contentReranker{err: fmt.Errorf("model unavailable")}, nil,
 		rag.AskRequest{Question: question, TopK: 4, Filters: suite, Rerank: true})
 	if err != nil {
 		t.Fatalf("a reranker failure must not fail the question: %v", err)
@@ -413,8 +436,86 @@ func testRerank(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder 
 	if failed.Reranked || !strings.Contains(failed.RerankError, "model unavailable") {
 		t.Fatalf("expected reranked=false with the failure reported, got reranked=%v error=%q", failed.Reranked, failed.RerankError)
 	}
-	if strings.Join(failed.Sources, "|") != strings.Join(base.Sources, "|") {
-		t.Fatalf("expected fallback to the retrieval order %q, got %q", base.Sources, failed.Sources)
+	if strings.Join(contents(failed.Sources), "|") != strings.Join(contents(base.Sources), "|") {
+		t.Fatalf("expected fallback to the retrieval order %q, got %q", contents(base.Sources), contents(failed.Sources))
+	}
+}
+
+// fakeChecker is a canned rag.JSONGenerator for the groundedness check:
+// its GenerateJSON always returns out, regardless of the prompt.
+type fakeChecker struct {
+	out string
+	err error
+}
+
+func (f fakeChecker) GenerateJSON(ctx context.Context, prompt string, schema json.RawMessage) (string, error) {
+	return f.out, f.err
+}
+
+// testGroundedness exercises CheckGrounded end-to-end through the real
+// Ask() pipeline (real retrieval, fake generator/checker): not requested,
+// requested and grounded, requested and flagged ungrounded, and requested
+// but the checker itself fails -- proving each leaves AskResponse in the
+// documented, unambiguous state rather than overlapping with another case.
+func testGroundedness(t *testing.T, ctx context.Context, pool *pgxpool.Pool, embedder fakeEmbedder) {
+	suite := json.RawMessage(`{"suite": "groundedness"}`)
+	const question = "what color is the sky"
+	embedder.vectors[question] = vec384(30)
+	embedder.vectors["The sky is blue."] = vec384(30)
+	if _, err := rag.Embed(ctx, pool, embedder, rag.EmbedRequest{Text: "The sky is blue.", Metadata: suite}); err != nil {
+		t.Fatalf("embed: %v", err)
+	}
+	askArgs := rag.AskRequest{Question: question, TopK: 1, Filters: suite}
+
+	notRequested, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{answer: "The sky is blue."}, nil, nil, askArgs)
+	if err != nil {
+		t.Fatalf("ask without check_grounded: %v", err)
+	}
+	if notRequested.Grounded {
+		t.Fatal("expected grounded=false when the check wasn't requested")
+	}
+	if notRequested.GroundednessError != "groundedness check not requested" {
+		t.Fatalf("expected an explanation for the unrequested check, got %q", notRequested.GroundednessError)
+	}
+
+	askArgs.CheckGrounded = true
+
+	grounded, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{answer: "The sky is blue [1]."}, nil,
+		fakeChecker{out: `{"grounded": true, "unsupported": []}`}, askArgs)
+	if err != nil {
+		t.Fatalf("ask with a grounded verdict: %v", err)
+	}
+	if !grounded.Grounded || grounded.GroundednessError != "" || len(grounded.Unsupported) != 0 {
+		t.Fatalf("expected a clean grounded verdict, got grounded=%v error=%q unsupported=%v",
+			grounded.Grounded, grounded.GroundednessError, grounded.Unsupported)
+	}
+
+	ungrounded, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{answer: "The sky is blue and it last rained on a Tuesday."}, nil,
+		fakeChecker{out: `{"grounded": false, "unsupported": ["it last rained on a Tuesday"]}`}, askArgs)
+	if err != nil {
+		t.Fatalf("ask with an ungrounded verdict: %v", err)
+	}
+	if ungrounded.Grounded || ungrounded.GroundednessError != "" {
+		t.Fatalf("expected grounded=false with no error (a real verdict, not a failure), got grounded=%v error=%q",
+			ungrounded.Grounded, ungrounded.GroundednessError)
+	}
+	if len(ungrounded.Unsupported) != 1 || ungrounded.Unsupported[0] != "it last rained on a Tuesday" {
+		t.Fatalf("expected the unsupported claim to pass through, got %v", ungrounded.Unsupported)
+	}
+
+	checkerFailed, err := rag.Ask(ctx, pool, embedder, &fakeGenerator{answer: "The sky is blue."}, nil,
+		fakeChecker{err: fmt.Errorf("model unavailable")}, askArgs)
+	if err != nil {
+		t.Fatalf("a checker failure must not fail the question: %v", err)
+	}
+	if checkerFailed.Grounded {
+		t.Fatal("expected grounded=false when the checker itself failed")
+	}
+	if !strings.Contains(checkerFailed.GroundednessError, "model unavailable") {
+		t.Fatalf("expected the checker failure reported, got %q", checkerFailed.GroundednessError)
+	}
+	if checkerFailed.Answer == "" {
+		t.Fatal("expected the answer to still be returned despite the checker failing")
 	}
 }
 
@@ -507,7 +608,7 @@ func testFilteredHNSW(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dbU
 	}
 
 	// The real code path finds all of tenant b's chunks.
-	resp, err := rag.Ask(ctx, idxPool, embedder, &fakeGenerator{}, nil, rag.AskRequest{
+	resp, err := rag.Ask(ctx, idxPool, embedder, &fakeGenerator{}, nil, nil, rag.AskRequest{
 		Question: "query", TopK: 3, Filters: tenantB,
 	})
 	if err != nil {
@@ -515,11 +616,11 @@ func testFilteredHNSW(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dbU
 	}
 	if len(resp.Sources) != len(tenantBTexts) {
 		t.Fatalf("expected all %d tenant b chunks (control found only %d), got %d: %q",
-			len(tenantBTexts), controlCount, len(resp.Sources), resp.Sources)
+			len(tenantBTexts), controlCount, len(resp.Sources), contents(resp.Sources))
 	}
 	for _, s := range resp.Sources {
-		if !strings.HasPrefix(s, "tenant b record") {
-			t.Fatalf("tenant b query returned another tenant's chunk: %q", s)
+		if !strings.HasPrefix(s.Content, "tenant b record") {
+			t.Fatalf("tenant b query returned another tenant's chunk: %q", s.Content)
 		}
 	}
 }

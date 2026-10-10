@@ -284,7 +284,7 @@ func TestRerankCandidatesFallsBack(t *testing.T) {
 
 func TestAskRejectsRerankWithoutReranker(t *testing.T) {
 	embedder := &countingEmbedder{}
-	_, err := Ask(context.Background(), nil, embedder, &fakeGenerator{}, nil, AskRequest{Question: "q", TopK: 3, Rerank: true})
+	_, err := Ask(context.Background(), nil, embedder, &fakeGenerator{}, nil, nil, AskRequest{Question: "q", TopK: 3, Rerank: true})
 	if err == nil {
 		t.Fatal("expected error when rerank is requested without a reranker")
 	}

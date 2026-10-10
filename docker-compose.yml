@@ -24,13 +24,13 @@ services:
       timeout: 5s
       retries: 30
 
-  # One-shot: pulls the embedding, chat, and rerank models, then exits. The
-  # worker waits on this completing successfully before it starts.
+  # One-shot: pulls every model the worker uses, then exits. The worker
+  # waits on this completing successfully before it starts.
   ollama-init:
     image: ollama/ollama:latest
     environment:
       OLLAMA_HOST: http://ollama:11434
-    entrypoint: ["/bin/sh", "-c", "ollama pull all-minilm && ollama pull qwen2.5:0.5b && ollama pull qwen2.5:3b"]
+    entrypoint: ["/bin/sh", "-c", "ollama pull all-minilm && ollama pull qwen2.5:0.5b && ollama pull qwen2.5:3b && ollama pull qwen2.5:7b"]
     depends_on:
       ollama:
         condition: service_healthy
@@ -48,6 +48,14 @@ services:
       # on test/eval's labeled set, 0.5B gave every passage the same score and
       # 1.5B was steered by an injected passage; 3B ranked 7/7 correctly.
       OLLAMA_RERANK_MODEL: qwen2.5:3b
+      # Groundedness checking (on by default) is a harder grading task than
+      # re-ranking: on test/eval's labeled set, 3B correctly caught the
+      # hallucination and the injection attempt but flagged two genuinely
+      # grounded answers (a paraphrase, a correct "not stated" decline) as
+      # unsupported -- 2/4 correct. 7B got all 4 right, with cleaner
+      # unsupported-claim extraction too. No prompt rewrite closed that
+      # gap at 3B (see docs/architecture.md), so this needs the larger model.
+      OLLAMA_GROUNDEDNESS_MODEL: qwen2.5:7b
     depends_on:
       postgres:
         condition: service_healthy

@@ -3,7 +3,7 @@
 -- same way basic.sql does for forecast.
 CALL pqnai.ask('what is in the documents?', 0);
 ERROR:  pqnai: top_k must be a positive integer
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 6 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 6 at RAISE
 SELECT pqnai.enqueue_job('embed', '{"text": "hello world"}'::jsonb) > 0 AS job_enqueued;
  job_enqueued 
 --------------
@@ -23,36 +23,36 @@ PL/pgSQL function pqnai.embed(text,text,jsonb,numeric,bigint) line 9 at assignme
 CALL pqnai.ask('what is in the documents?', 3, 1);
 ERROR:  pqnai: job 5 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 23 at assignment
 -- filters must be a JSON object: an array or scalar is valid jsonb but
 -- would silently match no source, so it's rejected before enqueuing.
 CALL pqnai.ask('what is in the documents?', 3, 1, '["not", "an", "object"]'::jsonb);
 ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 11 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 11 at RAISE
 CALL pqnai.ask('what is in the documents?', 3, 1, '"acme"'::jsonb);
 ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 11 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 11 at RAISE
 CALL pqnai.ask('what is in the documents?', 3, 1, NULL);
 ERROR:  pqnai: filters must be a JSON object, e.g. '{"tenant_id": "acme"}'
-CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 11 at RAISE
+CONTEXT:  PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 11 at RAISE
 -- A valid filter reaches the worker via the job payload; re-ranking is
--- off unless asked for.
+-- off and the groundedness check is on unless told otherwise.
 CALL pqnai.ask('what is in the documents?', 3, 1, '{"tenant_id": "acme"}'::jsonb);
 ERROR:  pqnai: job 6 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
-SELECT payload -> 'filters' AS filters, payload -> 'rerank' AS rerank
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 23 at assignment
+SELECT payload -> 'filters' AS filters, payload -> 'rerank' AS rerank, payload -> 'check_grounded' AS check_grounded
 FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
-        filters        | rerank 
------------------------+--------
- {"tenant_id": "acme"} | false
+        filters        | rerank | check_grounded 
+-----------------------+--------+----------------
+ {"tenant_id": "acme"} | false  | true
 (1 row)
 
 -- p_rerank reaches the worker; an explicit NULL means off.
 CALL pqnai.ask('what is in the documents?', 3, 1, p_rerank => true);
 ERROR:  pqnai: job 7 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 23 at assignment
 SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
  rerank 
 --------
@@ -62,17 +62,39 @@ SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDE
 CALL pqnai.ask('what is in the documents?', 3, 1, p_rerank => NULL);
 ERROR:  pqnai: job 8 timed out after 1 seconds
 CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
-PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,jsonb) line 22 at assignment
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 23 at assignment
 SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
  rerank 
 --------
  false
 (1 row)
 
--- Only the four valid ask() calls enqueued jobs; the rejected ones did not.
+-- p_check_grounded reaches the worker; an explicit NULL means on (the
+-- safe default), unlike p_rerank's NULL-means-off.
+CALL pqnai.ask('what is in the documents?', 3, 1, p_check_grounded => false);
+ERROR:  pqnai: job 9 timed out after 1 seconds
+CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 23 at assignment
+SELECT payload -> 'check_grounded' AS check_grounded FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+ check_grounded 
+----------------
+ false
+(1 row)
+
+CALL pqnai.ask('what is in the documents?', 3, 1, p_check_grounded => NULL);
+ERROR:  pqnai: job 10 timed out after 1 seconds
+CONTEXT:  PL/pgSQL function wait_for_job(bigint,numeric) line 22 at RAISE
+PL/pgSQL function pqnai.ask(text,integer,numeric,jsonb,boolean,boolean,jsonb) line 23 at assignment
+SELECT payload -> 'check_grounded' AS check_grounded FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+ check_grounded 
+----------------
+ true
+(1 row)
+
+-- Only the six valid ask() calls enqueued jobs; the rejected ones did not.
 SELECT count(*) AS ask_jobs FROM pqnai.jobs WHERE job_type = 'ask';
  ask_jobs 
 ----------
-        4
+        6
 (1 row)
 

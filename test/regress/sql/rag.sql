@@ -18,9 +18,9 @@ CALL pqnai.ask('what is in the documents?', 3, 1, '"acme"'::jsonb);
 CALL pqnai.ask('what is in the documents?', 3, 1, NULL);
 
 -- A valid filter reaches the worker via the job payload; re-ranking is
--- off unless asked for.
+-- off and the groundedness check is on unless told otherwise.
 CALL pqnai.ask('what is in the documents?', 3, 1, '{"tenant_id": "acme"}'::jsonb);
-SELECT payload -> 'filters' AS filters, payload -> 'rerank' AS rerank
+SELECT payload -> 'filters' AS filters, payload -> 'rerank' AS rerank, payload -> 'check_grounded' AS check_grounded
 FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
 
 -- p_rerank reaches the worker; an explicit NULL means off.
@@ -29,5 +29,12 @@ SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDE
 CALL pqnai.ask('what is in the documents?', 3, 1, p_rerank => NULL);
 SELECT payload -> 'rerank' AS rerank FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
 
--- Only the four valid ask() calls enqueued jobs; the rejected ones did not.
+-- p_check_grounded reaches the worker; an explicit NULL means on (the
+-- safe default), unlike p_rerank's NULL-means-off.
+CALL pqnai.ask('what is in the documents?', 3, 1, p_check_grounded => false);
+SELECT payload -> 'check_grounded' AS check_grounded FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+CALL pqnai.ask('what is in the documents?', 3, 1, p_check_grounded => NULL);
+SELECT payload -> 'check_grounded' AS check_grounded FROM pqnai.jobs WHERE job_type = 'ask' ORDER BY id DESC LIMIT 1;
+
+-- Only the six valid ask() calls enqueued jobs; the rejected ones did not.
 SELECT count(*) AS ask_jobs FROM pqnai.jobs WHERE job_type = 'ask';

@@ -26,9 +26,10 @@ const pollInterval = 5 * time.Second
 
 // worker bundles the dependencies every job handler needs.
 type worker struct {
-	pool     *pgxpool.Pool
-	ollama   *rag.OllamaClient
-	reranker rag.Reranker
+	pool          *pgxpool.Pool
+	ollama        *rag.OllamaClient
+	reranker      rag.Reranker
+	groundChecker rag.JSONGenerator
 }
 
 func main() {
@@ -43,6 +44,9 @@ func main() {
 	// Grading relevance is a different task from answering; a stronger
 	// model can be used for it without slowing every answer down.
 	rerankModel := envOr("OLLAMA_RERANK_MODEL", chatModel)
+	// Fact-checking an answer is also a grading task, not an answering
+	// one, so it defaults to the rerank model rather than the chat model.
+	groundednessModel := envOr("OLLAMA_GROUNDEDNESS_MODEL", rerankModel)
 	numCtx, err := strconv.Atoi(envOr("OLLAMA_NUM_CTX", strconv.Itoa(rag.DefaultNumCtx)))
 	if err != nil || numCtx <= 0 {
 		log.Fatalf("pqnaid: OLLAMA_NUM_CTX must be a positive integer, got %q", os.Getenv("OLLAMA_NUM_CTX"))
@@ -61,11 +65,14 @@ func main() {
 	ollama.NumCtx = numCtx
 	rerankClient := rag.NewOllamaClient(ollamaURL, embedModel, rerankModel)
 	rerankClient.NumCtx = numCtx
+	groundednessClient := rag.NewOllamaClient(ollamaURL, embedModel, groundednessModel)
+	groundednessClient.NumCtx = numCtx
 
 	w := &worker{
-		pool:     pool,
-		ollama:   ollama,
-		reranker: rag.NewLLMReranker(rerankClient),
+		pool:          pool,
+		ollama:        ollama,
+		reranker:      rag.NewLLMReranker(rerankClient),
+		groundChecker: groundednessClient,
 	}
 
 	log.Println("pqnaid: connected, draining any backlog")
@@ -190,7 +197,7 @@ func (w *worker) handleAsk(ctx context.Context, job *pgjobs.Job) {
 		return
 	}
 
-	resp, err := rag.Ask(ctx, w.pool, w.ollama, w.ollama, w.reranker, req)
+	resp, err := rag.Ask(ctx, w.pool, w.ollama, w.ollama, w.reranker, w.groundChecker, req)
 	if err != nil {
 		w.failJob(ctx, job.ID, err.Error())
 		return
